@@ -146,7 +146,7 @@ class PaliGemmaProcessor:
                 prefix_prompt=prompt,
                 bos_token=self.tokenizer.bos_token_id,
                 image_seq_len=self.image_seq_length,
-                image_token_id=self.IMAGE_TOKEN,
+                image_token=self.IMAGE_TOKEN,
             ) for prompt in text
         ]
         

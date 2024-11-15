@@ -15,13 +15,13 @@ class SiglipVisionConfig:
     patch_size: int = 16
     layer_norm_eps: float = 1e-6
     attention_dropout: float = 0.0
-    num_image_token: Optional[int] = None
+    num_image_tokens: Optional[int] = None
     kwargs: dict = field(default_factory=dict)  # To store any additional keyword arguments
 
 
 class SiglipVisionEmbeddings(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
-        super.__init__()
+        super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size
@@ -68,7 +68,7 @@ class SiglipMLP(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.intermediate_size = self.intermediate_size
+        self.intermediate_size = config.intermediate_size
         self.fc1 = nn.Linear(self.embed_dim, self.intermediate_size)
         self.fc2 = nn.Linear(self.intermediate_size, self.embed_dim)
 
@@ -84,7 +84,8 @@ class SiglipMLP(nn.Module):
 
 
 class SiglipAttention(nn.Module):
-    def __init(self, config: SiglipVisionConfig):
+    def __init__(self, config: SiglipVisionConfig):
+        super().__init__()
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
@@ -166,7 +167,7 @@ class SiglipEncoderLayer(nn.Module):
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
         hidden_states = self.layer_norm1(hidden_states)
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Embed_Dim]
-        hidden_states = self.self_attn(hidden_states=hidden_states)
+        hidden_states, _ = self.self_attn(hidden_states=hidden_states)
         # [Batch_Size, Num_Patches, Embed_Dim] 
         hidden_states = hidden_states + residual
         # residual: [Batch_Size, Num_Patches, Embed_Dim]
@@ -219,7 +220,7 @@ class SiglipVisionTransformer(nn.Module):
 class SiglipVisionModel(nn.Module):
 
     def __init__(self, config: SiglipVisionConfig):
-        super.__init__()
+        super().__init__()
         self.config = config
         self.vision_model = SiglipVisionTransformer(config)
 

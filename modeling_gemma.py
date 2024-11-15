@@ -1,6 +1,6 @@
 import torch
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from typing import Dict, List, Tuple, Union, Optional, Iterable
@@ -35,7 +35,7 @@ class KVCache:
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
         
         # and then we return the new cache
-        return self.key_states[layer_idx], self.value_states[layer_idx]
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
 
 @dataclass
@@ -57,8 +57,8 @@ class GemmaConfig:
 
 @dataclass
 class PaliGemmaConfig:
-    vision_config: dict = {}
-    text_config: dict = {}
+    vision_config: dict = field(default_factory=dict)
+    text_config: dict = field(default_factory=dict)
     ignore_index: int = -100
     image_token_index: int = 256_000
     vocab_size: int = 257_152
@@ -67,8 +67,11 @@ class PaliGemmaConfig:
     pad_token_id: int = None
 
     def __post_init__(self):
-        self.vision_config = SiglipVisionConfig(**self.vision_config)
-        self.text_config = GemmaConfig(**self.text_config, pad_token_id=self.pad_token_id)
+        
+        vision_config = {key: value for key, value in self.vision_config.items() if key in SiglipVisionConfig.__annotations__}        
+        self.vision_config = SiglipVisionConfig(**vision_config)
+        text_config = {key: value for key, value in self.text_config.items() if key in GemmaConfig.__annotations__}        
+        self.text_config = GemmaConfig(**text_config, pad_token_id=self.pad_token_id)
         self.text_config.num_image_tokens = (
             self.vision_config.image_size // self.vision_config.patch_size
         ) ** 2
@@ -97,7 +100,7 @@ class GemmaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
     
     def _norm(self, x):
-        return x * torch.rsqrt(x.power(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
     
     def forward(self, x):
         output = self._norm(x.float())
@@ -133,6 +136,65 @@ def repeat_kv(
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch_size, num_key_value_heads, n_repeats, sequence_length, head_dim)
     return hidden_states.reshape(batch_size, num_key_value_heads * n_repeats, sequence_length, head_dim)
+
+
+def rotate_half(x):
+    # build the [-x2, x1, -x4, x3, ...] tensor
+    x1 = x[..., :x.shape[-1] // 2] # first half of the last dimension
+    x2 = x[..., x.shape[-1] // 2:] # second half of the last dimension
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q, k, cos, sin, unsqueeze_dim=1
+):
+    cos = cos.unsqueeze(unsqueeze_dim) # add the head dimension
+    sin = sin.unsqueeze(unsqueeze_dim) # add the head dimension
+    # apply the formula from the paper
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    
+    return q_embed, k_embed
+
+
+class GemmaRotatoryEmbedding(nn.Module):
+    def __init__(self, head_dim: int, max_position_embeddings: int, base: float):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        
+        # calculate the theta based on the formula from the paper
+        # theta_i = base ** (2 * i / head_dim) where i = 0, 1, 2, ..., head_dim//2
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+    
+    @torch.no_grad()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_len: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        # hidden_states : [batch_size, num_heads, seq_len, head_dim]
+        self.inv_freq.to(hidden_states.device)
+        # inv freq expanded: [batch_size, head_dim//2, 1]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, -1)
+        # position_ids expanded: [batch_size, 1, seq_len]
+        device_type = hidden_states.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        
+        with torch.autocast(device_type=device_type, enabled=False):
+            # multiply theta by position_ids
+            # freqs: [batch_size, head_dim//2, seq_len] @ [batch_size, 1, seq_len] -> [batch_size, head_dim//2, seq_len]
+            freqs = (inv_freq_expanded * position_ids.float()).transpose(1, 2)
+            embd = torch.cat((freqs, freqs), dim=-1)
+            # cos and sin: [batch_size, head_dim, seq_len]
+            cos = embd.cos()
+            sin = embd.sin()
+            
+        return cos.to(hidden_states.dtype), sin.to(hidden_states.dtype)
 
 
 class GemmaAttention(nn.Module):
@@ -366,15 +428,24 @@ class GemmaForCausalLM(nn.Module):
         
         # Shape (batch_size, sequence_length, vocab_size)
         logits = self.lm_head(hidden_states)
-        
-        return logits, kv_cache
+        logits = logits.float()
+
+        return_data = {
+            "logits": logits,
+        }
+
+        if kv_cache is not None:
+            # Return the updated cache
+            return_data["kv_cache"] = kv_cache
+
+        return return_data
 
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     
     def __init__(self, config: PaliGemmaConfig):
         super().__init__()
-        self.config = config
+        self.config = config        
         self.vision_model = SiglipVisionModel(config.vision_config)
         self.multi_model_projection = PaliGemmaMultiModalProjection(config)
         self.vocab_size = config.vocab_size
@@ -415,39 +486,40 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         padding_mask = input_ids == self.pad_token_id
         
         # we need to expand the masks to the embedding dimension otherwise we can't use torch.where
-        text_mask_expanded = text_mask.unsqueeze(-1).expand_as(inputs_embed)
-        image_mask_expanded = image_mask.unsqueeze(-1).expand_as(scaled_images_embed)
-        padding_mask_expanded = padding_mask.unsqueeze(-1).expand_as(inputs_embed)
+        text_mask_expanded = text_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
+        image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
+        padding_mask_expanded = padding_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
         
         # add the text embeddings to the combined embeddings
         embeds = torch.where(text_mask_expanded, inputs_embed, embeds)
         # add the image embeddings to the combined embeddings
         # we will use mask scatter here as the scaled_images_embed has a different shape
-        embeds = torch.masked_scatter(image_mask_expanded, scaled_images_embed)
+        embeds = embeds.masked_scatter(image_mask_expanded, scaled_images_embed)
         # mask out the padding tokens
         embeds = torch.where(padding_mask_expanded, torch.zeros_like(embeds), embeds)
         
         # Create the attention mask
         
+        q_len = inputs_embed.shape[1]
         min_dtype = torch.finfo(dtype).min
         
-        if kv_cache is None or kv_cache.num_items == 0:
+        if kv_cache is None or kv_cache.num_items() == 0:
             # do not mast any tokens, because we are in prefilling phase
             # this only works when we have no padding
             causal_mask = torch.full(
-                (batch_size, sequence_length, sequence_length),
+                (batch_size, q_len, q_len),
                 fill_value=0,
                 dtype=dtype,
                 device=device,
             )
         else:
             # we are in generation phase so query must be one single token
-            assert sequence_length == 1, "Query must be one single token"
+            assert q_len == 1, "Query must be one single token"
             kv_len = kv_cache.num_items() + sequence_length
             # also in this case we do not mask any tokens, since it needs to attend to all previous tokens
             # this only works when we have no padding
             causal_mask = torch.full(
-                (batch_size, sequence_length, kv_len),
+                (batch_size, q_len, kv_len),
                 fill_value=0,
                 dtype=dtype,
                 device=device,
@@ -458,11 +530,11 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # unsqueeze(1) adds the extra dimension to do mat addition
         causal_mask = causal_mask.unsqueeze(1)
         
-        if kv_cache is not None and kv_cache.num_items > 0:
+        if kv_cache is not None and kv_cache.num_items() > 0:
             # the position of the query is just the last position
             position_ids = attention_mask.cumsum(dim=-1)[:, -1]
             if position_ids.dim() == 1:
-                position_ids = position_ids.unsqueeze(-1)
+                position_ids = position_ids.unsqueeze(0)
         
         else:
             # create a position ids based on the size og the attention mask
